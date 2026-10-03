@@ -1,0 +1,101 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shizuha-atlas-data
+  namespace: shizuha
+  labels:
+    app: shizuha-atlas
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shizuha-atlas
+  namespace: shizuha
+  labels:
+    app: shizuha-atlas
+spec:
+  selector:
+    app: shizuha-atlas
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shizuha-atlas
+  namespace: shizuha
+  labels:
+    app: shizuha-atlas
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: shizuha-atlas
+  template:
+    metadata:
+      labels:
+        app: shizuha-atlas
+    spec:
+      securityContext:
+        fsGroup: 10001
+      tolerations:
+        - key: node.shizuha/workstation
+          operator: Exists
+          effect: NoSchedule
+        - key: shizuha.com/inference-paused
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: atlas
+          image: localhost:30500/shizuha-atlas:PLACEHOLDER
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ATLAS_DB
+              value: /data/atlas.db
+            - name: ATLAS_CATALOG
+              value: /app/catalog/system.json
+            - name: ATLAS_JWKS_URL
+              value: http://shizuha-id.shizuha.svc.cluster.local:8001/.well-known/jwks.json
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 192Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: shizuha-atlas-data
+        - name: tmp
+          emptyDir: {}
