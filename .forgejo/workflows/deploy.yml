@@ -1,0 +1,401 @@
+# Shizuha Origin CI/CD — MULTI-ARCH build + deploy atlas (ORIG-7 Plan A).
+# Lives in the Origin-canonical atlas repo and triggers on its own pushes.
+# Builds atlas for BOTH amd64 + arm64 via two in-cluster kaniko Jobs (arch-matched nodes),
+# combines them into a multi-arch manifest list with crane, deploys the list, and verifies.
+# Multi-arch = the image runs on any platform node (s1 amd64 OR gx10 arm64) per PLAT-718 —
+# no single-arch regression / exec-format crashes. Auth = KUBE_CONFIG_B64 org secret
+# (least-privilege origin-ci-deployer SA). No submodule checkout, no docker-in-DinD.
+name: deploy-atlas
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+# Only the latest commit per branch builds; a newer push cancels an older in-flight run.
+# GitHub is only a downstream read-only mirror; it never supplies CI source.
+concurrency:
+  group: deploy-atlas-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) KUBECTL_ARCH=amd64; KUBECTL_SHA256="7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3" ;;
+            aarch64|arm64) KUBECTL_ARCH=arm64; KUBECTL_SHA256="420e6110e3ba7ee5a3927b5af868d18df17aae36b720529ffa4e9e945aa95450" ;;
+            *) echo "Unsupported runner arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          curl --retry 3 --retry-all-errors --retry-delay 1 --max-time 60 -fsSL \
+            -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          echo "${KUBECTL_SHA256}  kubectl" | sha256sum -c -
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Multi-arch build + deploy + verify
+        run: |
+          wait_kubectl_job() {
+            # ORIG-199: kubectl wait --for=condition=complete never returns on a FAILED
+            # Job (the Complete condition never sets), so failures burned the full timeout
+            # and surfaced 'timed out waiting for the condition' (the waiter) instead of
+            # the job's own error. Poll for BOTH terminal conditions and return as soon as
+            # either is reached; fetch the job's own output on failure.
+            local ns="$1" job="$2" timeout_s="$3" deadline complete failed
+            deadline=$((SECONDS + timeout_s))
+            while (( SECONDS < deadline )); do
+              complete="$(kubectl -n "$ns" get "$job" \
+                -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)"
+              failed="$(kubectl -n "$ns" get "$job" \
+                -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null)"
+              if [ "$complete" = True ]; then
+                return 0
+              fi
+              if [ "$failed" = True ]; then
+                echo "::error::$job FAILED — fetching its own output" >&2
+                kubectl -n "$ns" logs "$job" --all-containers=true --tail=-1 >&2 || true
+                kubectl -n "$ns" describe "$job" >&2 || true
+                return 1
+              fi
+              sleep 5
+            done
+            echo "::error::$job did not reach a terminal condition within ${timeout_s}s" >&2
+            # Pending Jobs never become Complete/Failed, so ttlSecondsAfterFinished
+            # never fires. Delete on waiter timeout so the next dispatch can reuse
+            # the exact Job name (8h admin amd64 Pending orphans, 2026-08-30).
+            kubectl -n "$ns" describe "$job" >&2 || true
+            kubectl -n "$ns" delete "$job" --wait=false --ignore-not-found=true >&2 || true
+            return 1
+          }
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          TAG="atlas-${SHORT}"
+          REG="registry.registry.svc.cluster.local:5000"
+          echo "Multi-arch build shizuha-atlas:${TAG} (amd64 + arm64)"
+
+          # PLAT-5287: every repository consumes the same immutable guard
+          # payload. The ConfigMap lives in the Origin namespace because the
+          # existing least-privilege CI identity has read access there; no
+          # private cross-repository workflow token is required.
+          BUILD_GUARD_CONFIGMAP="origin-ci-build-guard-650fec631781"
+          BUILD_GUARD_SHA256="650fec631781edce0e4980f0fb07b12ab78b67b1faf780b214d12a40f9dddcf6"
+          BUILD_GUARD="${RUNNER_TEMP:-/tmp}/origin-ci-build-guard.py"
+          kubectl get "configmap/${BUILD_GUARD_CONFIGMAP}" -n origin \
+            -o jsonpath='{.data.guard\.py}' >"${BUILD_GUARD}"
+          echo "${BUILD_GUARD_SHA256}  ${BUILD_GUARD}" | sha256sum -c -
+
+          render_workspace_gc_job() {
+            cat <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-workspace-gc-atlas-${SHORT}
+            namespace: build
+            labels: { app: ci-workspace-gc, shizuha.io/orig-task: PLAT-3396 }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: amd64 }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  # s1 overlay to the in-cluster registry works; it carries
+                  # operator=unschedulable. i9-ws overlay times out (keep excluded).
+                  - { key: operator, operator: Equal, value: unschedulable, effect: NoSchedule }
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - { key: kubernetes.io/hostname, operator: NotIn, values: [i9-ws] }
+                containers:
+                  - name: gc
+                    image: busybox:1.36
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -eu
+                        mkdir -p /workspaces
+                        find /workspaces -mindepth 1 -maxdepth 1 -type d -mtime +2 -prune -exec rm -rf {} +
+                    volumeMounts: [{ mountPath: /workspaces, name: workspaces }]
+                volumes:
+                  - name: workspaces
+                    hostPath:
+                      path: /media/phoenix/NVMe_Backup/origin-ci-workspaces
+                      type: DirectoryOrCreate
+          YAML
+          }
+
+          render_build_job() {  # $1=arch
+            local ARCH="$1"
+            local WORKSPACE_VOLUME
+            # PLAT-3396: amd64 builds all land on s1. Keep their git context and
+            # Kaniko workspace on s1's spare nvme4n1 ext4 mount instead of the
+            # shared root filesystem on nvme3n1, where concurrent builds can
+            # saturate unrelated platform work. arm64 remains node-local emptyDir.
+            if [ "${ARCH}" = "amd64" ]; then
+              WORKSPACE_VOLUME=$(cat <<EOF
+                volumes:
+                  - name: workspace
+                    hostPath:
+                      path: /media/phoenix/NVMe_Backup/origin-ci-workspaces/atlas-${SHORT}-${ARCH}
+                      type: DirectoryOrCreate
+          EOF
+          )
+            else
+              WORKSPACE_VOLUME='      volumes: [{ emptyDir: {}, name: workspace }]'
+            fi
+            cat <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-build-atlas-${SHORT}-${ARCH}
+            namespace: build
+            labels: { app: ci-build, shizuha.io/orig-task: ORIG-7 }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: ${ARCH} }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                  # amd64 kaniko on i9-ws times out pushing to registry ClusterIP
+                  # (nft FORWARD DROP + kube-router; overlay never hits FLANNEL-FWD).
+                  # s1 overlay works; it carries operator=unschedulable. Do not
+                  # remove the s1 operator-hold taint — CI tolerates it instead.
+                  - { key: operator, operator: Equal, value: unschedulable, effect: NoSchedule }
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+                        # i9-ws overlay to ns registry is i/o timeout. Keep excluded
+                        # until ClusterIP/FORWARD on i9-ws is actually fixed.
+                        - { key: kubernetes.io/hostname, operator: NotIn, values: [i9-ws] }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        git init /workspace/src
+                        cd /workspace/src
+                        git remote add origin "http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/atlas.git"
+                        git fetch --depth=1 origin "${{ github.sha }}"
+                        git checkout --detach FETCH_HEAD
+                        test "\$(git rev-parse HEAD)" = "${{ github.sha }}"
+                        # Force package ecosystem traffic through in-cluster
+                        # pull-through caches even when service Dockerfiles
+                        # have bare pip/npm install RUN steps.
+                        if [ -f /workspace/src/Dockerfile ]; then
+                          awk '
+                            /^FROM[[:space:]]/ {
+                              print
+                              print "ARG NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/"
+                              print "ARG PIP_INDEX_URL=http://pip-cache.registry.svc.cluster.local/simple/"
+                              print "ARG PIP_TRUSTED_HOST=pip-cache.registry.svc.cluster.local"
+                              print "ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}"
+                              print "ENV PIP_INDEX_URL=${PIP_INDEX_URL}"
+                              print "ENV PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}"
+                              next
+                            }
+                            {
+                              # Keep apt traffic on the LAN cache without a
+                              # global http_proxy (which can break pod-IP curls).
+                              gsub(/apt-get update/, "apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 update")
+                              gsub(/apt-get install/, "apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 install")
+                              print
+                            }
+                          ' /workspace/src/Dockerfile > /workspace/src/Dockerfile.cache-wired
+                          mv /workspace/src/Dockerfile.cache-wired /workspace/src/Dockerfile
+                        fi
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=dir:///workspace/src
+                      - --dockerfile=/workspace/src/Dockerfile
+                      - --destination=${REG}/shizuha-atlas:${TAG}-${ARCH}
+                      - --cleanup
+                      - --insecure
+                      - --skip-tls-verify
+                      - --insecure-pull
+                      - --registry-mirror=mirror-dockerhub.registry.svc.cluster.local:5000
+                      - --build-arg=NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/
+                      - --build-arg=PIP_INDEX_URL=http://pip-cache.registry.svc.cluster.local/simple/
+                      - --build-arg=PIP_TRUSTED_HOST=pip-cache.registry.svc.cluster.local
+                      - --cache=true
+                      - --cache-repo=${REG}/kaniko-cache/shizuha-atlas-${ARCH}
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+          ${WORKSPACE_VOLUME}
+          YAML
+          }
+
+          AMD64_JOB="ci-build-atlas-${SHORT}-amd64"
+          ARM64_JOB="ci-build-atlas-${SHORT}-arm64"
+          cleanup_build_pair() {
+            python3 "$BUILD_GUARD" cleanup \
+              --namespace build --job "$AMD64_JOB" --job "$ARM64_JOB"
+          }
+          cleanup_on_failure() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then cleanup_build_pair || true; fi
+            exit "$rc"
+          }
+          trap cleanup_on_failure EXIT INT TERM
+
+          # Guard 1 runs before any amd64-bound workspace/build Job. Cleanup is
+          # exact-name and waits, so a retry never attaches to stale state.
+          python3 "$BUILD_GUARD" preflight --arch amd64 --arch arm64
+          cleanup_build_pair
+
+          # Keep old s1 hostPath workspaces bounded before launching a new amd64 build.
+          render_workspace_gc_job | kubectl apply -f -
+          wait_kubectl_job build "job/ci-workspace-gc-atlas-${SHORT}" 120 || {
+            echo "::warning::workspace GC did not complete; continuing with build and relying on TTL/manual cleanup"
+            kubectl logs -n build "job/ci-workspace-gc-atlas-${SHORT}" --tail=80 || true
+          }
+
+          # Launch both arch builds in parallel
+          render_build_job amd64 | kubectl apply -f -
+          render_build_job arm64 | kubectl apply -f -
+
+          # Guard 2 watches the actual Pod conditions. The 1800-second deadline
+          # remains the backstop for states the condition watch does not know.
+          python3 "$BUILD_GUARD" wait-pair --namespace build \
+            --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
+            --timeout-seconds 1800
+          trap - EXIT INT TERM
+          echo "Both arch builds done."
+
+          # Combine into a multi-arch manifest list with crane
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-manifest-atlas-${SHORT}
+            namespace: build
+            labels: { app: ci-manifest, shizuha.io/orig-task: ORIG-7 }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: crane
+                    image: gcr.io/go-containerregistry/crane:latest
+                    # Image entrypoint IS the crane binary (distroless, no shell) — pass args directly.
+                    args:
+                      - index
+                      - append
+                      - --insecure
+                      - -t
+                      - ${REG}/shizuha-atlas:${TAG}
+                      - -m
+                      - ${REG}/shizuha-atlas:${TAG}-amd64
+                      - -m
+                      - ${REG}/shizuha-atlas:${TAG}-arm64
+          YAML
+          wait_kubectl_job build "job/ci-manifest-atlas-${SHORT}" 300 || {
+            echo "::error::manifest combine failed"; kubectl logs -n build "job/ci-manifest-atlas-${SHORT}" --tail=30 || true; exit 1; }
+
+          verify_manifest() {
+            local REPO="$1"
+            local IMAGE_TAG="$2"
+            local JOB="ci-verify-atlas-${SHORT}"
+            cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-verify, shizuha.io/orig-task: ORIG-7 }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: manifest-check
+                    image: python:3.12-alpine
+                    command: ["python", "-c"]
+                    args:
+                      - |
+                        import json, sys, urllib.request
+                        url = "http://${REG}/v2/${REPO}/manifests/${IMAGE_TAG}"
+                        accept = ",".join([
+                            "application/vnd.oci.image.index.v1+json",
+                            "application/vnd.docker.distribution.manifest.list.v2+json",
+                        ])
+                        req = urllib.request.Request(url, headers={"Accept": accept})
+                        with urllib.request.urlopen(req, timeout=30) as resp:
+                            manifest = json.load(resp)
+                        platforms = {
+                            f"{m.get('platform', {}).get('os')}/{m.get('platform', {}).get('architecture')}"
+                            for m in manifest.get("manifests", [])
+                        }
+                        missing = {"linux/amd64", "linux/arm64"} - platforms
+                        print(f"{url} platforms={sorted(platforms)}")
+                        if missing:
+                            raise SystemExit(f"missing required platform(s): {sorted(missing)}")
+          YAML
+            wait_kubectl_job build "job/${JOB}" 120 || {
+              echo "::error::manifest verification failed"
+              kubectl logs -n build "job/${JOB}" --tail=80 || true
+              exit 1
+            }
+            kubectl logs -n build "job/${JOB}" --tail=20 || true
+          }
+          verify_manifest "shizuha-atlas" "${TAG}"
+
+          PREV="$(kubectl get deploy -n shizuha shizuha-atlas -o jsonpath='{.spec.template.spec.containers[?(@.name=="atlas")].image}' 2>/dev/null || true)"
+          if [ -n "${PREV}" ]; then
+            echo "Current image: ${PREV}"
+            echo "Rollback command: kubectl set image -n shizuha deploy/shizuha-atlas atlas=${PREV} && kubectl rollout status -n shizuha deploy/shizuha-atlas"
+          fi
+
+          IMAGE="localhost:30500/shizuha-atlas:${TAG}"
+          MANIFEST="${RUNNER_TEMP:-/tmp}/atlas.yaml"
+          test -f k8s/atlas.yaml
+          sed "s#localhost:30500/shizuha-atlas:PLACEHOLDER#${IMAGE}#" k8s/atlas.yaml > "${MANIFEST}"
+          if grep -q PLACEHOLDER "${MANIFEST}"; then
+            echo "::error::manifest still has PLACEHOLDER"
+            exit 1
+          fi
+          grep -q "${TAG}" "${MANIFEST}"
+          if kubectl get deploy -n shizuha shizuha-atlas >/dev/null 2>&1; then
+            GRACE_UNTIL="$(date -u -d '+30 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+            kubectl annotate -n shizuha deploy/shizuha-atlas --overwrite \
+              shizuha.io/desired-image="${IMAGE}" \
+              shizuha.io/desired-container="atlas" \
+              shizuha.io/deploy-drift-grace-until="${GRACE_UNTIL}"
+          fi
+          kubectl apply -f "${MANIFEST}"
+          GRACE_UNTIL="$(date -u -d '+30 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+          kubectl annotate -n shizuha deploy/shizuha-atlas --overwrite \
+            shizuha.io/desired-image="${IMAGE}" \
+            shizuha.io/desired-container="atlas" \
+            shizuha.io/deploy-drift-grace-until="${GRACE_UNTIL}"
+          kubectl rollout status -n shizuha deploy/shizuha-atlas --timeout=600s
+          LIVE="$(kubectl get deploy -n shizuha shizuha-atlas -o jsonpath='{.spec.template.spec.containers[?(@.name=="atlas")].image}')"
+          echo "Live: ${LIVE}"
+          echo "${LIVE}" | grep -q "${TAG}" || { echo "::error::image mismatch"; exit 1; }
+          echo "OK multi-arch ${TAG}"
+          kubectl exec -n shizuha deploy/shizuha-atlas -- python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).read().decode())"
