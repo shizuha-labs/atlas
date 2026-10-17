@@ -38,7 +38,7 @@ def token(memberships, user_id=3):
 
 
 @pytest.fixture()
-def client():
+def client(active_revocation_authority):
     with TestClient(app) as test:
         yield test
 
@@ -219,3 +219,36 @@ def test_library_searches_pages_and_stays_inside_memberships(client):
     capped = client.get("/atlas/api/maps", headers=headers, params={"limit": 500}).json()
     assert capped["limit"] == 60
     assert "document" not in capped["maps"][0]
+
+
+def test_local_password_signs_in_without_identity(monkeypatch):
+    monkeypatch.setenv("ATLAS_LOCAL_PASSWORD", "correct horse")
+    monkeypatch.delenv("ATLAS_JWKS_URL", raising=False)
+    monkeypatch.delenv("SHIZUHA_REVOCATION_STATUS_URL", raising=False)
+    import token_revocation
+    token_revocation._REVOCATION_CACHE.clear()
+    with TestClient(app) as test:
+        assert test.get("/atlas/api/auth").json()["mode"] == "local"
+        denied = test.get("/atlas/api/maps")
+        assert denied.status_code == 401
+        assert denied.json()["detail"] == "Sign in to this Atlas."
+        wrong = test.post("/atlas/api/login", json={"username": "ada", "password": "nope"})
+        assert wrong.status_code == 401
+        signed = test.post("/atlas/api/login", json={"username": "ada", "password": "correct horse"})
+        assert signed.status_code == 200
+        header = {"Authorization": f"Bearer {signed.json()['access_token']}"}
+        listed = test.get("/atlas/api/maps", headers=header)
+        assert listed.status_code == 200
+        assert listed.json()["total"] >= 1
+        who = test.get("/atlas/api/session", headers=header)
+        assert who.status_code == 200
+        assert who.json()["username"] == "ada"
+        assert who.json()["memberships"] == {"1": "owner"}
+
+
+def test_platform_mode_rejects_local_password(monkeypatch, client):
+    monkeypatch.setenv("ATLAS_JWKS_URL", "https://identity.example/jwks")
+    monkeypatch.setenv("ATLAS_LOCAL_PASSWORD", "correct horse")
+    assert client.get("/atlas/api/auth").json() == {"mode": "platform"}
+    response = client.post("/atlas/api/login", json={"password": "correct horse"})
+    assert response.status_code == 404

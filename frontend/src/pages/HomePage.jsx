@@ -58,6 +58,10 @@ export default function HomePage() {
   const [names, setNames] = useState({})
   const [organizations, setOrganizations] = useState([])
   const [error, setError] = useState('')
+  const [localSignIn, setLocalSignIn] = useState(false)
+  const [localName, setLocalName] = useState('atlas')
+  const [localPassword, setLocalPassword] = useState('')
+  const [sessionEpoch, setSessionEpoch] = useState(0)
   const [loadingMore, setLoadingMore] = useState(false)
   const generation = useRef(0)
   const writtenQuery = useRef(qParam)
@@ -109,6 +113,7 @@ export default function HomePage() {
     const ticket = ++generation.current
     let live = true
     setError('')
+    setLocalSignIn(false)
     atlasApi(pagePath({ q: debounced, organizationId: org, kind, offset: 0 })).then(payload => {
       if (!live || generation.current !== ticket) return
       setMaps(payload.maps || [])
@@ -117,14 +122,35 @@ export default function HomePage() {
     }).catch(failure => {
       if (!live || generation.current !== ticket) return
       setError(failure.message)
+      setLocalSignIn(Boolean(failure.local))
       setMaps(current => current || [])
     })
     return () => { live = false }
-  }, [debounced, org, kind])
+  }, [debounced, org, kind, sessionEpoch])
 
   const filtering = Boolean(debounced || org || kind)
   const shown = maps?.length || 0
   const chips = kindOrder(kinds.includes(kind) || !kind ? kinds : [...kinds, kind])
+
+  async function submitLocal(event) {
+    event.preventDefault()
+    try {
+      const response = await fetch('/atlas/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: localName, password: localPassword }),
+      })
+      const payload = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(payload.detail || 'Sign in to this Atlas.')
+      localStorage.setItem('shizuha_access_token', payload.access_token)
+      setLocalPassword('')
+      setLocalSignIn(false)
+      setSessionEpoch(value => value + 1)
+    } catch (failure) {
+      setError(failure.message)
+      setLocalSignIn(true)
+    }
+  }
 
   function setFilter(key, value) {
     const next = new URLSearchParams(params)
@@ -199,7 +225,18 @@ export default function HomePage() {
           <div className="empty-state">
             <h1>{error.includes('Sign in') ? 'Sign in to see your maps' : 'Atlas is unavailable'}</h1>
             <p>{error}</p>
-            {error.includes('Sign in') && <button className="button primary" type="button" onClick={signIn}>Sign in</button>}
+            {localSignIn && (
+              <form className="local-sign-in" onSubmit={submitLocal}>
+                <label>Name
+                  <input value={localName} onChange={event => setLocalName(event.target.value)} autoComplete="username" />
+                </label>
+                <label>Password
+                  <input type="password" value={localPassword} onChange={event => setLocalPassword(event.target.value)} autoComplete="current-password" />
+                </label>
+                <button className="button primary" type="submit">Sign in</button>
+              </form>
+            )}
+            {!localSignIn && error.includes('Sign in') && <button className="button primary" type="button" onClick={signIn}>Sign in</button>}
           </div>
         )}
         {maps && maps.length === 0 && !error && (

@@ -8,6 +8,8 @@ from dataclasses import dataclass
 import jwt
 from jwt import PyJWKClient
 
+from token_revocation import is_token_revoked
+
 
 @dataclass(frozen=True)
 class Caller:
@@ -59,6 +61,25 @@ def caller_from_claims(claims: dict) -> Caller:
     )
 
 
+def platform_revocation_required() -> bool:
+    """Shizuha ID is the revocation authority only for a platform install.
+
+    A standalone process sets ATLAS_JWT_SECRET and does not set a JWKS or
+    revocation URL. Its tokens are not in the ID store, and the default
+    http://shizuha-id:8001 lookup would fail closed and lock the operator out.
+    """
+    if os.environ.get("SHIZUHA_REVOCATION_STATUS_URL", "").strip():
+        return True
+    if os.environ.get("ATLAS_JWKS_URL", "").strip():
+        return True
+    return False
+
+
+def _reject_if_revoked(claims: dict, token: str) -> None:
+    if platform_revocation_required() and is_token_revoked(claims, token):
+        raise jwt.InvalidTokenError("Token has been revoked")
+
+
 def verify_token(token: str) -> Caller:
     secret = os.environ.get("ATLAS_JWT_SECRET")
     if secret:
@@ -68,6 +89,7 @@ def verify_token(token: str) -> Caller:
             algorithms=["HS256"],
             options={"verify_aud": False},
         )
+        _reject_if_revoked(claims, token)
         return caller_from_claims(claims)
     jwks_url = os.environ.get("ATLAS_JWKS_URL")
     if not jwks_url:
@@ -85,4 +107,5 @@ def verify_token(token: str) -> Caller:
         algorithms=["RS256"],
         options={"verify_aud": False},
     )
+    _reject_if_revoked(claims, token)
     return caller_from_claims(claims)

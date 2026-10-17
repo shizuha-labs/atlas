@@ -26,12 +26,27 @@ export function accessToken() {
   return localStorage.getItem('shizuha_access_token') || ''
 }
 
+let authModePromise
+
+export function authMode() {
+  if (!authModePromise) {
+    authModePromise = fetch('/atlas/api/auth')
+      .then(response => (response.ok ? response.json() : { mode: 'platform' }))
+      .catch(() => ({ mode: 'platform' }))
+  }
+  return authModePromise
+}
+
 export function signIn() {
   const here = `${window.location.pathname}${window.location.search}`
   window.location.assign(`/id/login?continue=${encodeURIComponent(here)}`)
 }
 
 export async function loadOrganizations() {
+  const mode = await authMode()
+  if (mode.mode === 'local') {
+    return [{ id: String(mode.organization_id || '1'), name: mode.organization_name || 'Local' }]
+  }
   const token = accessToken()
   if (!token) return []
   try {
@@ -56,8 +71,11 @@ export async function atlasApi(path, options = {}) {
   if (options.body) headers['Content-Type'] = 'application/json'
   const response = await fetch(`/atlas/api${path}`, { ...options, headers })
   if (response.status === 401) {
-    signIn()
-    throw new Error('Sign in with Shizuha ID.')
+    const mode = await authMode()
+    if (mode.mode !== 'local') signIn()
+    const error = new Error(mode.mode === 'local' ? 'Sign in to this Atlas.' : 'Sign in with Shizuha ID.')
+    error.local = mode.mode === 'local'
+    throw error
   }
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) {
