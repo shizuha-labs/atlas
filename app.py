@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hmac
 import os
 import re
+import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
@@ -28,7 +30,7 @@ _KIND = re.compile(r"^[a-z0-9_-]{1,32}$")
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = os.environ.get("ATLAS_DB", "/tmp/atlas.db")
-CATALOG = Path(os.environ.get("ATLAS_CATALOG", ROOT / "catalog" / "system.json"))
+CATALOG = Path(os.environ.get("ATLAS_CATALOG", ROOT / "catalog" / "sample.json"))
 STATIC = ROOT / "static"
 
 
@@ -52,13 +54,21 @@ def database():
         db.close()
 
 
+def _sign_in_detail() -> str:
+    if os.environ.get("ATLAS_JWKS_URL", "").strip():
+        return "Sign in with Shizuha ID."
+    if os.environ.get("ATLAS_JWT_SECRET", "").strip():
+        return "Sign in to this Atlas."
+    return "Sign in with Shizuha ID."
+
+
 def caller_from(authorization: str | None):
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Sign in with Shizuha ID.")
+        raise HTTPException(status_code=401, detail=_sign_in_detail())
     try:
         return verify_token(authorization.removeprefix("Bearer ").strip())
     except jwt.InvalidTokenError as exc:
-        raise HTTPException(status_code=401, detail="Sign in with Shizuha ID.") from exc
+        raise HTTPException(status_code=401, detail=_sign_in_detail()) from exc
 
 
 def require_org(caller, organization_id: int) -> None:
@@ -82,6 +92,11 @@ class MapWrite(BaseModel):
     organization_id: int | None = None
 
 
+class LocalLogin(BaseModel):
+    username: str = "atlas"
+    password: str = ""
+
+
 api = APIRouter()
 
 
@@ -99,6 +114,47 @@ def session(authorization: str | None = Header(default=None)):
         "is_staff": caller.is_staff,
         "memberships": caller.memberships,
     }
+
+
+@api.get("/auth")
+def auth_mode():
+    if os.environ.get("ATLAS_JWKS_URL", "").strip():
+        return {"mode": "platform"}
+    if os.environ.get("ATLAS_JWT_SECRET", "").strip():
+        name = os.environ.get("ATLAS_LOCAL_ORGANIZATION", "Local").strip() or "Local"
+        return {
+            "mode": "local",
+            "organization_id": "1",
+            "organization_name": name,
+            "password": bool(os.environ.get("ATLAS_LOCAL_PASSWORD", "").strip()),
+        }
+    return {"mode": "unconfigured"}
+
+
+@api.post("/login")
+def local_login(body: LocalLogin):
+    if os.environ.get("ATLAS_JWKS_URL", "").strip():
+        raise HTTPException(status_code=404, detail="This Atlas uses Shizuha ID.")
+    secret = os.environ.get("ATLAS_JWT_SECRET", "").strip()
+    expected = os.environ.get("ATLAS_LOCAL_PASSWORD", "")
+    if not secret or not expected:
+        raise HTTPException(status_code=404, detail="Local sign-in is not configured.")
+    if not hmac.compare_digest(body.password, expected):
+        raise HTTPException(status_code=401, detail="Wrong password.")
+    username = " ".join(body.username.split())[:80] or "atlas"
+    encoded = jwt.encode(
+        {
+            "user_id": 1,
+            "username": username,
+            "organization_memberships": {"1": "owner"},
+            "exp": int(time.time()) + 12 * 60 * 60,
+        },
+        secret,
+        algorithm="HS256",
+    )
+    if isinstance(encoded, bytes):
+        encoded = encoded.decode()
+    return {"access_token": encoded, "token_type": "bearer"}
 
 
 @api.get("/maps")

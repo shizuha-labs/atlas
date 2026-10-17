@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "id": "example-store",
+  "title": "Example store",
+  "description": "Synthetic documentation sample; not a deployed system or a live health view.",
+  "model_revision": "example-1",
+  "updated_at": "2026-01-01T00:00:00Z",
+  "coverage": {"scope": "Synthetic example", "limitations": ["Explanatory relationships, not runtime traces"]},
+  "nodes": [
+    {"id": "example-store", "label": "Example store", "kind": "system", "parent_id": null, "description": "A fictional storefront.", "sources": [], "status": "declared"},
+    {"id": "experience", "label": "Experience", "kind": "domain", "parent_id": "example-store", "description": "Customer interaction.", "sources": [], "status": "declared"},
+    {"id": "commerce", "label": "Commerce", "kind": "domain", "parent_id": "example-store", "description": "Order processing.", "sources": [], "status": "declared"},
+    {"id": "storefront", "label": "Storefront", "kind": "service", "parent_id": "experience", "description": "Collects an example order.", "sources": [], "status": "declared"},
+    {"id": "orders", "label": "Orders", "kind": "service", "parent_id": "commerce", "description": "Validates and records an example order.", "sources": [], "status": "declared"},
+    {"id": "validation", "label": "Validation", "kind": "component", "parent_id": "orders", "description": "Checks order inputs.", "sources": [], "status": "declared"}
+  ],
+  "edges": [
+    {"id": "submit-order", "source": "storefront", "target": "validation", "kind": "http", "label": "Submit order", "sources": [], "status": "declared"}
+  ],
+  "flows": [
+    {"id": "order-journey", "label": "Place an order", "description": "A single illustrative step, not a full sequence model.", "steps": [{"id": "submit", "label": "Submit order", "source": "storefront", "target": "validation", "description": "The storefront sends order inputs for validation.", "edge_ids": ["submit-order"]}]}
+  ]
+}

@@ -67,6 +67,8 @@ spec:
               value: /data/atlas.db
             - name: ATLAS_CATALOG
               value: /app/catalog/system.json
+            - name: SHIZUHA_REVOCATION_STATUS_URL
+              value: http://shizuha-id.shizuha.svc.cluster.local.:8001/api/oauth/revocation-status
             - name: ATLAS_JWKS_URL
               value: http://shizuha-id.shizuha.svc.cluster.local:8001/.well-known/jwks.json
           readinessProbe:
